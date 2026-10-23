@@ -1,46 +1,258 @@
-<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CAMFED Admin</title><link rel="stylesheet" href="/style.css"></head>
-<body class="purple-page"><div class="container"><div class="card"><img src="/images/camfed-logo.png" class="logo" alt="CAMFED logo" onerror="this.style.display='none'"><h1>CAMFED Attendance Admin</h1>
-<section id="loginSection"><h2>Admin Login</h2><form id="loginForm"><label>Username<input id="username" required></label><label>Password<input id="password" type="password" required></label><button>Login</button><p id="loginMsg" class="message"></p></form></section>
-<section id="dashboard" hidden><div class="admin-top"><h2>Events</h2><button id="logout" class="secondary">Logout</button></div><form id="eventForm" class="event-form"><input id="eventName" placeholder="Event name" required><input id="eventDate" type="date" required><input id="eventVenue" placeholder="Venue" required><button>Create Event</button></form><div id="events"></div></section>
-</div></div><script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script><script>
-const $=id=>document.getElementById(id); async function api(url,opt={}){const r=await fetch(url,opt);const d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.error||'Request failed');return d;}
-async function check(){try{await api('/api/admin/me');$('loginSection').hidden=true;$('dashboard').hidden=false;loadEvents();}catch{}}
-$('loginForm').onsubmit=async e=>{e.preventDefault();try{await api('/api/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('username').value,password:$('password').value})});$('loginMsg').textContent='';check();}catch(x){$('loginMsg').className='message error';$('loginMsg').textContent=x.message;}};
-$('logout').onclick=async()=>{await api('/api/admin/logout',{method:'POST'});location.reload();};
-$('eventForm').onsubmit=async e=>{e.preventDefault();const submit=e.target.querySelector('button[type="submit"],button:not([type])');if(submit)submit.disabled=true;try{const result=await api('/api/admin/events',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('eventName').value,date:$('eventDate').value,venue:$('eventVenue').value})});e.target.reset();alert(result.message||'Event created.');await loadEvents();}catch(x){alert(x.message);}finally{if(submit)submit.disabled=false;}};
-async function loadEvents(){const events=await api('/api/admin/events');$('events').innerHTML=events.length?'':'<p>No events yet.</p>';events.forEach(ev=>{const d=document.createElement('div');d.className='event-card';const expired=Date.now()>=Date.parse(ev.registration_expires_at||new Date(Date.parse(ev.created_at)+2*60*60*1000));const reportStatus=expired?`<p class="expiry-notice"><strong>Registration expired.</strong> Download the attendance PDF and CSV for this event.</p>`:'';d.innerHTML=`<h3>${esc(ev.name)}</h3><p>${esc(ev.date)} · ${esc(ev.venue)}</p><p><strong>${ev.attendee_count}</strong> attendees</p><p>Registration link: <a href="/register/${encodeURIComponent(ev.slug)}" target="_blank" rel="noopener"><code>${esc(location.origin)}/register/${esc(ev.slug)}</code></a> <button type="button" onclick="copyLink('${esc(ev.slug)}')">Copy Link</button></p><div class="event-qr"><img loading="lazy" width="160" height="160" alt="Registration QR code for ${esc(ev.name)}" src="https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=${encodeURIComponent(location.origin + '/register/' + ev.slug)}"><p>Scan to register for this event</p></div><button type="button" onclick="downloadQrPdf('${esc(ev.name).replace(/'/g, "&#39;")}','${esc(ev.date)}','${esc(ev.venue).replace(/'/g, "&#39;")}','${esc(ev.slug)}')">Download QR Code (PDF)</button> <button onclick="view(${ev.id})">View Attendees</button> <button onclick="pdf(${ev.id})">Download PDF</button> <button onclick="csv(${ev.id})">Download CSV</button> <button class="danger" onclick="deleteEvent(${ev.id},'${esc(ev.name).replace(/'/g, '&#39;')}',${ev.attendee_count})">Delete Event</button>${reportStatus}<div id="list-${ev.id}"></div>`;$('events').appendChild(d);if(expired){const key='camfed-expiry-prompt-'+ev.id;if(!sessionStorage.getItem(key)){sessionStorage.setItem(key,'shown');setTimeout(()=>alert(`Registration for "${ev.name}" has expired. Use Download PDF and Download CSV on the event card to save the attendance reports.`),100);}}});}
-async function copyLink(slug){const link=location.origin+'/register/'+slug;try{await navigator.clipboard.writeText(link);alert('Registration link copied.');}catch{prompt('Copy this registration link:',link);}}
-async function downloadQrPdf(name,date,venue,slug){
-  const link=location.origin+'/register/'+slug;
-  const qrUrl='https://api.qrserver.com/v1/create-qr-code/?size=600x600&format=png&data='+encodeURIComponent(link);
-  try {
-    const response=await fetch(qrUrl); if(!response.ok) throw Error('Could not generate QR code. Check your internet connection and try again.');
-    const blob=await response.blob(); const reader=new FileReader();
-    reader.onload=()=>{
-      if(!window.jspdf||!window.jspdf.jsPDF){alert('PDF generator is unavailable. Check your internet connection and try again.');return;}
-      const {jsPDF}=window.jspdf; const doc=new jsPDF({unit:'mm',format:'a4'});
-      doc.setFontSize(20); doc.text('CAMFED Event Registration',105,22,{align:'center'});
-      doc.setFontSize(14); doc.text(String(name),105,35,{align:'center',maxWidth:175});
-      doc.setFontSize(11); doc.text('Date: '+String(date),105,48,{align:'center'}); doc.text('Venue: '+String(venue),105,56,{align:'center',maxWidth:175});
-      doc.addImage(reader.result,'PNG',55,68,100,100);
-      doc.setFontSize(11); doc.text('Scan this QR code to register for the event',105,178,{align:'center'});
-      doc.setFontSize(9); doc.text(link,105,188,{align:'center',maxWidth:180});
-      const safeName=String(name).replace(/[^a-z0-9_-]+/gi,'_').replace(/^_+|_+$/g,'')||'event';
-      doc.save('CAMFED_'+safeName+'_Registration_QR.pdf');
-    }; reader.readAsDataURL(blob);
-  } catch(e){alert(e.message||'Unable to download QR PDF. Please try again.');}
-}
-async function view(id){const x=await api('/api/admin/events/'+id+'/attendees');const box=$('list-'+id);box.innerHTML=x.attendees.length?'<div class="table-wrap"><table><tr><th>No.</th><th>Name</th><th>Gender</th><th>Designation</th><th>Organisation</th><th>Phone</th><th>NRC</th><th>District</th><th>Action</th></tr>'+x.attendees.map((a,i)=>`<tr><td>${i+1}</td><td>${esc(a.full_name)}</td><td>${esc(a.gender)}</td><td>${esc(a.designation)}</td><td>${esc(a.organisation)}</td><td>${esc(a.phone_number)}</td><td>${esc(a.nrc_number)}</td><td>${esc(a.district)}</td><td><button class=\"danger\" onclick=\"deleteAttendee(${a.id},${id},'${esc(a.full_name).replace(/'/g, '&#39;')}')\">Delete</button></td></tr>`).join('')+'</table></div>':'<p>No attendees.</p>';}
-async function deleteEvent(eventId,eventName,attendeeCount){
-  const warning = `Delete the event "${eventName}" and all ${attendeeCount} attendee record(s)? This also removes saved signatures and cannot be undone.`;
-  if(!confirm(warning)) return;
-  try {
-    const result = await api('/api/admin/events/'+eventId,{method:'DELETE'});
-    alert(`Event deleted. ${result.deletedAttendees} attendee record(s) were also removed.`);
-    await loadEvents();
-  } catch(e) { alert(e.message); }
-}
-async function deleteAttendee(attendeeId,eventId,fullName){if(!confirm(`Delete the record for ${fullName}? This action cannot be undone.`))return;try{await api('/api/admin/attendees/'+attendeeId,{method:'DELETE'});await view(eventId);await loadEvents();}catch(e){alert(e.message);}}
-setInterval(()=>{if(!$('dashboard').hidden)loadEvents().catch(()=>{});},30000);
-function pdf(id){window.location.href='/api/admin/events/'+id+'/pdf';} function csv(id){window.location.href='/api/admin/events/'+id+'/csv';} function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));} check();
-</script></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#f4f6fb">
+  <title>CAMFED Attendance | Admin</title>
+  <link rel="stylesheet" href="/admin.css">
+</head>
+<body class="admin-page">
+  <section id="loginSection" class="login-screen">
+    <form id="loginForm" class="login-card">
+      <img src="/images/camfed-logo.png" class="admin-logo" alt="CAMFED logo" onerror="this.style.display='none'">
+      <span class="eyebrow">CAMFED ATTENDANCE</span>
+      <h1>Welcome back</h1>
+      <p>Sign in to manage events and attendance.</p>
+      <label for="username">Username</label>
+      <input id="username" autocomplete="username" required>
+      <label for="password">Password</label>
+      <input id="password" type="password" autocomplete="current-password" required>
+      <button class="admin-primary login-submit">Sign in</button>
+      <p id="loginMsg" class="message" aria-live="polite"></p>
+    </form>
+  </section>
+
+  <div id="dashboard" class="admin-shell" hidden>
+    <aside class="admin-sidebar">
+      <a class="brand" href="#overview" aria-label="CAMFED attendance overview">
+        <img src="/images/camfed-logo.png" alt="CAMFED">
+        <span>Attendance<small>ADMIN PORTAL</small></span>
+      </a>
+      <p class="nav-label">WORKSPACE</p>
+      <nav class="admin-nav" aria-label="Admin navigation">
+        <a class="active" href="#overview"><span class="nav-icon">▦</span>Overview</a>
+        <a href="#events-section"><span class="nav-icon">▣</span>Events</a>
+        <a href="#attendees-section"><span class="nav-icon">♙</span>Attendees</a>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="sidebar-user"><span class="user-avatar">C</span><span>CAMFED Admin<small>Attendance team</small></span></div>
+        <button id="logout" class="logout-button" type="button">Sign out <span aria-hidden="true">↗</span></button>
+      </div>
+    </aside>
+
+    <main class="admin-main">
+      <header class="admin-header">
+        <div><span class="eyebrow">CAMFED ZAMBIA</span><h1>Attendance dashboard</h1></div>
+        <div class="header-actions"><span id="todayLabel" class="today-label"></span><a class="admin-primary" href="#create-event">＋ Create event</a></div>
+      </header>
+
+      <section id="overview" class="dashboard-section">
+        <div class="welcome-row"><div><p class="eyebrow">YOUR WORKSPACE</p><h2>Good to see you</h2><p>Here’s the latest across your events and registrations.</p></div><span class="live-pill"><i></i> Live overview</span></div>
+        <div class="stat-grid">
+          <article class="stat-card"><div class="stat-top"><span>Total registrations</span><span class="stat-icon blue">01</span></div><strong id="totalAttendees">0</strong><small>Across all events</small></article>
+          <article class="stat-card"><div class="stat-top"><span>Events created</span><span class="stat-icon violet">02</span></div><strong id="totalEvents">0</strong><small>All time</small></article>
+          <article class="stat-card"><div class="stat-top"><span>Open registration</span><span class="stat-icon green">03</span></div><strong id="openEvents">0</strong><small>Registration links accepting entries</small></article>
+          <article class="stat-card"><div class="stat-top"><span>New this week</span><span class="stat-icon amber">04</span></div><strong id="weekAttendees">0</strong><small>Registrations in the last 7 days</small></article>
+        </div>
+
+        <div class="overview-grid">
+          <article class="panel chart-panel">
+            <div class="panel-heading"><div><span class="eyebrow">AT A GLANCE</span><h3>Attendance by event</h3></div><span class="panel-tag">Registrations</span></div>
+            <div id="eventChart" class="event-chart"><p class="empty-state">Your event activity will appear here.</p></div>
+          </article>
+          <article class="panel status-panel">
+            <div class="panel-heading"><div><span class="eyebrow">REGISTRATION LINKS</span><h3>Event status</h3></div><span class="status-mark">↗</span></div>
+            <div class="status-total"><strong id="statusTotal">0</strong><span>events</span></div>
+            <div class="status-row"><span><i class="status-dot open"></i>Open</span><strong id="statusOpen">0</strong></div>
+            <div class="status-row"><span><i class="status-dot closed"></i>Expired</span><strong id="statusClosed">0</strong></div>
+            <div class="status-track"><span id="statusTrack"></span></div>
+            <p class="status-note">Registration links remain open for two hours after an event is created.</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="create-event" class="panel create-panel dashboard-section">
+        <div class="panel-heading"><div><span class="eyebrow">GET STARTED</span><h3>Create an event</h3><p>Add an event to generate its attendee registration link.</p></div><span class="create-spark">＋</span></div>
+        <form id="eventForm" class="event-form">
+          <label>Event name<input id="eventName" placeholder="e.g. Regional partners meeting" required></label>
+          <label>Date<input id="eventDate" type="date" required></label>
+          <label>Venue<input id="eventVenue" placeholder="Enter venue" required></label>
+          <button class="admin-primary" type="submit">Create event <span aria-hidden="true">→</span></button>
+        </form>
+      </section>
+
+      <section id="events-section" class="dashboard-section">
+        <div class="section-heading"><div><span class="eyebrow">EVENT MANAGEMENT</span><h2>Your events</h2><p>Share registration links and download attendance reports.</p></div><span id="eventCountBadge" class="count-badge">0 events</span></div>
+        <div id="events" class="events-grid"><div class="panel empty-state">Loading events…</div></div>
+      </section>
+
+      <section id="attendees-section" class="panel recent-panel dashboard-section">
+        <div class="panel-heading"><div><span class="eyebrow">LATEST ACTIVITY</span><h3>Recent registrations</h3><p>Most recent attendee sign-ups across all events.</p></div><span class="recent-icon">◷</span></div>
+        <div class="table-wrap"><table class="recent-table"><thead><tr><th>ATTENDEE</th><th>EVENT</th><th>ORGANISATION</th><th>REGISTERED</th></tr></thead><tbody id="recentAttendees"><tr><td colspan="4" class="empty-state">Loading registrations…</td></tr></tbody></table></div>
+      </section>
+      <footer class="admin-footer">CAMFED Attendance Management <span>·</span> Admin workspace</footer>
+    </main>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <script>
+    const $ = id => document.getElementById(id);
+    let currentEvents = [];
+    async function api(url, opt = {}) {
+      const response = await fetch(url, opt);
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw Error(data.error || 'Request failed');
+      return data;
+    }
+    function esc(value) {
+      return String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+    }
+    function expired(event) {
+      const end = Date.parse(event.registration_expires_at || new Date(Date.parse(event.created_at) + 2 * 60 * 60 * 1000));
+      return !Number.isFinite(end) || Date.now() >= end;
+    }
+    function formatDate(value, options = {day:'numeric',month:'short',year:'numeric'}) {
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? '—' : new Intl.DateTimeFormat(undefined, options).format(date);
+    }
+    async function check() {
+      try {
+        await api('/api/admin/me');
+        $('loginSection').hidden = true;
+        $('dashboard').hidden = false;
+        $('todayLabel').textContent = formatDate(new Date(), {weekday:'short',day:'numeric',month:'short',year:'numeric'});
+        await loadEvents();
+      } catch {}
+    }
+    $('loginForm').onsubmit = async event => {
+      event.preventDefault();
+      try {
+        await api('/api/admin/login', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('username').value,password:$('password').value})});
+        $('loginMsg').textContent = '';
+        await check();
+      } catch (error) {
+        $('loginMsg').className = 'message error';
+        $('loginMsg').textContent = error.message;
+      }
+    };
+    $('logout').onclick = async () => { await api('/api/admin/logout', {method:'POST'}); location.reload(); };
+    $('eventForm').onsubmit = async event => {
+      event.preventDefault();
+      const button = event.currentTarget.querySelector('button[type="submit"]');
+      button.disabled = true;
+      try {
+        const result = await api('/api/admin/events', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('eventName').value,date:$('eventDate').value,venue:$('eventVenue').value})});
+        event.currentTarget.reset();
+        alert(result.message || 'Event created.');
+        await loadEvents();
+      } catch (error) { alert(error.message); }
+      finally { button.disabled = false; }
+    };
+    async function loadEvents() {
+      const events = await api('/api/admin/events');
+      currentEvents = events;
+      const attendeeResults = await Promise.all(events.map(event => api(`/api/admin/events/${event.id}/attendees`).catch(() => ({attendees:[]}))));
+      const attendees = attendeeResults.flatMap((result, index) => result.attendees.map(attendee => ({...attendee,eventName:events[index].name})));
+      renderOverview(events, attendees);
+      renderEvents(events);
+      renderRecent(attendees);
+    }
+    function renderOverview(events, attendees) {
+      const open = events.filter(event => !expired(event)).length;
+      const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+      const thisWeek = attendees.filter(attendee => Date.parse(attendee.created_at) >= weekAgo).length;
+      $('totalAttendees').textContent = attendees.length.toLocaleString();
+      $('totalEvents').textContent = events.length.toLocaleString();
+      $('openEvents').textContent = open.toLocaleString();
+      $('weekAttendees').textContent = thisWeek.toLocaleString();
+      $('statusTotal').textContent = events.length.toLocaleString();
+      $('statusOpen').textContent = open.toLocaleString();
+      $('statusClosed').textContent = (events.length - open).toLocaleString();
+      $('statusTrack').style.width = events.length ? `${(open / events.length) * 100}%` : '0%';
+      $('eventCountBadge').textContent = `${events.length} ${events.length === 1 ? 'event' : 'events'}`;
+      const chartEvents = [...events].sort((a,b) => b.attendee_count - a.attendee_count).slice(0,5);
+      const max = Math.max(1, ...chartEvents.map(event => event.attendee_count || 0));
+      $('eventChart').innerHTML = chartEvents.length ? chartEvents.map(event => `<div class="chart-row"><div class="chart-label"><span title="${esc(event.name)}">${esc(event.name)}</span><strong>${Number(event.attendee_count || 0).toLocaleString()}</strong></div><div class="chart-track"><span style="width:${Math.max(4, (Number(event.attendee_count || 0) / max) * 100)}%"></span></div></div>`).join('') : '<p class="empty-state">Create an event to see attendance activity here.</p>';
+    }
+    function renderEvents(events) {
+      const host = $('events');
+      if (!events.length) {
+        host.innerHTML = '<div class="panel empty-events"><span class="empty-illustration">▣</span><h3>No events yet</h3><p>Create your first event to start collecting registrations.</p><a href="#create-event" class="admin-primary">Create your first event</a></div>';
+        return;
+      }
+      host.innerHTML = events.map(event => {
+        const isExpired = expired(event);
+        const link = `${location.origin}/register/${encodeURIComponent(event.slug)}`;
+        const qr = `https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(link)}`;
+        return `<article class="event-card"><div class="event-card-top"><span class="event-calendar">${esc(formatDate(event.date,{month:'short',day:'numeric'}))}</span><span class="event-status ${isExpired?'closed':'open'}"><i></i>${isExpired?'Registration closed':'Registration open'}</span></div><h3>${esc(event.name)}</h3><p class="event-meta"><span>⌖</span>${esc(event.venue)} <span class="meta-divider">·</span> ${esc(formatDate(event.date))}</p><div class="event-attendance"><strong>${Number(event.attendee_count||0).toLocaleString()}</strong><span>registrations</span></div><div class="event-link-box"><span>REGISTRATION LINK</span><a href="/register/${encodeURIComponent(event.slug)}" target="_blank" rel="noopener">${esc(link)}</a><button class="copy-link" data-action="copy" data-slug="${esc(event.slug)}" type="button">Copy</button></div><details class="event-qr-details"><summary>Show QR code</summary><div class="event-qr"><img loading="lazy" width="120" height="120" alt="Registration QR code for ${esc(event.name)}" src="${qr}"><span>Scan to register for this event</span></div></details><div class="event-actions"><button class="action-button" data-action="view" data-id="${event.id}" type="button">View attendees</button><button class="action-button" data-action="qr-pdf" data-id="${event.id}" data-name="${esc(event.name)}" data-date="${esc(event.date)}" data-venue="${esc(event.venue)}" data-slug="${esc(event.slug)}" type="button">QR PDF</button><button class="action-button" data-action="pdf" data-id="${event.id}" type="button">Attendance PDF</button><button class="action-button" data-action="csv" data-id="${event.id}" type="button">CSV</button><button class="action-button danger-text" data-action="delete-event" data-id="${event.id}" data-name="${esc(event.name)}" data-count="${Number(event.attendee_count||0)}" type="button">Delete</button></div>${isExpired?'<p class="expiry-notice"><strong>Registration link expired.</strong> You can still download the event reports.</p>':''}<div id="list-${event.id}" class="event-attendee-list"></div></article>`;
+      }).join('');
+    }
+    function renderRecent(attendees) {
+      const rows = [...attendees].sort((a,b) => Date.parse(b.created_at) - Date.parse(a.created_at)).slice(0,8);
+      $('recentAttendees').innerHTML = rows.length ? rows.map(attendee => `<tr><td><span class="attendee-cell"><span class="attendee-avatar">${esc((attendee.full_name||'?').trim().charAt(0).toUpperCase())}</span><strong>${esc(attendee.full_name)}</strong></span></td><td>${esc(attendee.eventName)}</td><td>${esc(attendee.organisation)}</td><td>${esc(formatDate(attendee.created_at,{day:'numeric',month:'short',hour:'numeric',minute:'2-digit'}))}</td></tr>`).join('') : '<tr><td colspan="4" class="empty-state">No registrations yet. New attendees will appear here.</td></tr>';
+    }
+    async function copyLink(slug) {
+      const link = `${location.origin}/register/${slug}`;
+      try { await navigator.clipboard.writeText(link); alert('Registration link copied.'); }
+      catch { prompt('Copy this registration link:', link); }
+    }
+    async function downloadQrPdf(name,date,venue,slug) {
+      const link = `${location.origin}/register/${slug}`;
+      const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=600x600&format=png&data=${encodeURIComponent(link)}`;
+      try {
+        const response = await fetch(qrUrl);
+        if (!response.ok) throw Error('Could not generate QR code. Check your internet connection and try again.');
+        const reader = new FileReader();
+        reader.onload = () => {
+          if (!window.jspdf || !window.jspdf.jsPDF) { alert('PDF generator is unavailable. Check your internet connection and try again.'); return; }
+          const {jsPDF} = window.jspdf;
+          const doc = new jsPDF({unit:'mm',format:'a4'});
+          doc.setFontSize(20); doc.text('CAMFED Event Registration',105,22,{align:'center'});
+          doc.setFontSize(14); doc.text(String(name),105,35,{align:'center',maxWidth:175});
+          doc.setFontSize(11); doc.text(`Date: ${date}`,105,48,{align:'center'}); doc.text(`Venue: ${venue}`,105,56,{align:'center',maxWidth:175});
+          doc.addImage(reader.result,'PNG',55,68,100,100);
+          doc.setFontSize(11); doc.text('Scan this QR code to register for the event',105,178,{align:'center'});
+          doc.setFontSize(9); doc.text(link,105,188,{align:'center',maxWidth:180});
+          const safeName = String(name).replace(/[^a-z0-9_-]+/gi,'_').replace(/^_+|_+$/g,'') || 'event';
+          doc.save(`CAMFED_${safeName}_Registration_QR.pdf`);
+        };
+        reader.readAsDataURL(await response.blob());
+      } catch (error) { alert(error.message || 'Unable to download QR PDF. Please try again.'); }
+    }
+    async function view(id) {
+      const result = await api(`/api/admin/events/${id}/attendees`);
+      const box = $(`list-${id}`);
+      box.innerHTML = result.attendees.length ? `<div class="table-wrap"><table><thead><tr><th>No.</th><th>Name</th><th>Gender</th><th>Designation</th><th>Organisation</th><th>Phone</th><th>NRC</th><th>District</th><th>Action</th></tr></thead><tbody>${result.attendees.map((attendee,index) => `<tr><td>${index+1}</td><td>${esc(attendee.full_name)}</td><td>${esc(attendee.gender)}</td><td>${esc(attendee.designation)}</td><td>${esc(attendee.organisation)}</td><td>${esc(attendee.phone_number)}</td><td>${esc(attendee.nrc_number)}</td><td>${esc(attendee.district)}</td><td><button class="action-button danger-text" data-action="delete-attendee" data-id="${attendee.id}" data-event="${id}" data-name="${esc(attendee.full_name)}" type="button">Delete</button></td></tr>`).join('')}</tbody></table></div>` : '<p class="empty-state">No attendees for this event yet.</p>';
+    }
+    async function deleteEvent(eventId,eventName,attendeeCount) {
+      if (!confirm(`Delete the event "${eventName}" and all ${attendeeCount} attendee record(s)? This also removes saved signatures and cannot be undone.`)) return;
+      try { const result = await api(`/api/admin/events/${eventId}`,{method:'DELETE'}); alert(`Event deleted. ${result.deletedAttendees} attendee record(s) were also removed.`); await loadEvents(); }
+      catch (error) { alert(error.message); }
+    }
+    async function deleteAttendee(attendeeId,eventId,fullName) {
+      if (!confirm(`Delete the record for ${fullName}? This action cannot be undone.`)) return;
+      try { await api(`/api/admin/attendees/${attendeeId}`,{method:'DELETE'}); await view(eventId); await loadEvents(); }
+      catch (error) { alert(error.message); }
+    }
+    $('events').addEventListener('click', async event => {
+      const button = event.target.closest('[data-action]');
+      if (!button) return;
+      const id = Number(button.dataset.id);
+      try {
+        switch (button.dataset.action) {
+          case 'copy': await copyLink(button.dataset.slug); break;
+          case 'view': await view(id); break;
+          case 'pdf': location.href = `/api/admin/events/${id}/pdf`; break;
+          case 'csv': location.href = `/api/admin/events/${id}/csv`; break;
+          case 'qr-pdf': await downloadQrPdf(button.dataset.name,button.dataset.date,button.dataset.venue,button.dataset.slug); break;
+          case 'delete-event': await deleteEvent(id,button.dataset.name,Number(button.dataset.count)); break;
+          case 'delete-attendee': await deleteAttendee(id,Number(button.dataset.event),button.dataset.name); break;
+        }
+      } catch (error) { alert(error.message); }
+    });
+    setInterval(() => { if (!$('dashboard').hidden) loadEvents().catch(() => {}); }, 60000);
+    check();
+  </script>
+</body>
+</html>
