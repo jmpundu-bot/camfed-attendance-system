@@ -23,6 +23,15 @@ npm install
 npm start
 ```
 
+## Vercel deployment
+
+Vercel functions use temporary `/tmp` storage for runtime files. The app can
+start there, but its JSON records, signatures, and generated PDFs are not
+durable across function instances or redeployments. Connect a persistent
+database and file storage before using this deployment for real attendance
+records. Set `ADMIN_USERNAME`, `ADMIN_PASSWORD`, and `SESSION_SECRET` in the
+Vercel project environment variables; do not use the local default credentials.
+
 Open http://localhost:3000/
 
 Admin: http://localhost:3000/admin

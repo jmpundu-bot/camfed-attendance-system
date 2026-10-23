@@ -15,15 +15,19 @@ if (fs.existsSync(envPath)) {
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
+const IS_VERCEL = process.env.VERCEL === '1';
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'ChangeThisPassword123!';
 const SESSION_SECRET = process.env.SESSION_SECRET || 'camfed-local-session-secret-change-me';
 
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, 'public');
-const DATA_DIR = path.join(ROOT, 'data');
-const SIG_DIR = path.join(ROOT, 'signatures');
-const PDF_DIR = path.join(ROOT, 'pdfs');
+// Vercel's deployed application directory is read-only. Use /tmp for runtime
+// files there; local development keeps the existing project directories.
+const RUNTIME_DIR = IS_VERCEL ? path.join('/tmp', 'camfed-attendance-system') : ROOT;
+const DATA_DIR = path.join(RUNTIME_DIR, 'data');
+const SIG_DIR = path.join(RUNTIME_DIR, 'signatures');
+const PDF_DIR = path.join(RUNTIME_DIR, 'pdfs');
 const DATA_FILE = path.join(DATA_DIR, 'data.json');
 [DATA_DIR, SIG_DIR, PDF_DIR].forEach(dir => fs.mkdirSync(dir, { recursive: true }));
 
@@ -334,6 +338,16 @@ app.get('/api/admin/events/:id/pdf',requireAdmin,async(req,res)=>{const e=data.e
 app.use((req,res,next)=>{if(req.method==='GET'&&req.accepts('html'))return res.status(404).sendFile(path.join(PUBLIC_DIR,'404.html'));next();});
 app.use((err,req,res,next)=>{console.error(err);res.status(500).json({error:'Internal server error.'});});
 
-const server=app.listen(PORT,()=>{console.log(`CAMFED Attendance System running at http://localhost:${PORT}`);console.log(`Admin: http://localhost:${PORT}/admin`);console.log(`Login username: ${ADMIN_USERNAME}`);console.log(`Login password: ${ADMIN_PASSWORD}`);});
-function shutdown(){server.close(()=>process.exit(0));}
-process.on('SIGINT',shutdown);process.on('SIGTERM',shutdown);
+if (require.main === module) {
+  const server = app.listen(PORT, () => {
+    console.log(`CAMFED Attendance System running at http://localhost:${PORT}`);
+    console.log(`Admin: http://localhost:${PORT}/admin`);
+    console.log(`Login username: ${ADMIN_USERNAME}`);
+    console.log(`Login password: ${ADMIN_PASSWORD}`);
+  });
+  function shutdown() { server.close(() => process.exit(0)); }
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+}
+
+module.exports = app;
