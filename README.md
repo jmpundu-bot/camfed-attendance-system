@@ -23,14 +23,30 @@ npm install
 npm start
 ```
 
-## Vercel deployment
+## PostgreSQL and Vercel deployment
 
-Vercel functions use temporary `/tmp` storage for runtime files. The app can
-start there, but its JSON records, signatures, and generated PDFs are not
-durable across function instances or redeployments. Connect a persistent
-database and file storage before using this deployment for real attendance
-records. Set `ADMIN_USERNAME`, `ADMIN_PASSWORD`, and `SESSION_SECRET` in the
-Vercel project environment variables; do not use the local default credentials.
+The app uses PostgreSQL when `POSTGRES_URL`, `DATABASE_URL`, or
+`POSTGRES_PRISMA_URL` is configured. Without a database URL, local development
+continues to use the ignored `data/data.json` file. Vercel runtime files under
+`/tmp` are temporary, so configure PostgreSQL before collecting real records.
+
+1. In the Vercel project, install the Neon Postgres integration from the Vercel
+   Marketplace and connect it to the project. Use the pooled connection URL
+   provided by the integration.
+2. Put that URL in your local `.env` as `POSTGRES_URL=...` when running the
+   database commands below. Keep `.env` private and out of Git.
+3. Create the tables with `npm run db:migrate`.
+4. If you have existing JSON records to preserve, run `npm run db:import-json`
+   once after the migration. The importer also copies signature images from
+   `signatures/` into PostgreSQL. Attendee records are preserved even if a
+   legacy signature image is missing.
+5. Confirm the integration has added the connection variable to Vercel's
+   Production and Preview environments, then deploy.
+
+Events, attendee details, and signature PNG data are stored in PostgreSQL. The
+attendance PDF is generated for download using temporary function storage. Set
+`ADMIN_USERNAME`, `ADMIN_PASSWORD`, and `SESSION_SECRET` in Vercel's project
+environment variables; do not use the local default credentials.
 
 Open http://localhost:3000/
 

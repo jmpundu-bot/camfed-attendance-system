@@ -3,15 +3,8 @@ const PDFDocument = require('pdfkit');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-
-// Load .env without requiring a native module or an extra dependency.
-const envPath = path.join(__dirname, '.env');
-if (fs.existsSync(envPath)) {
-  for (const line of fs.readFileSync(envPath, 'utf8').split(/\r?\n/)) {
-    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
-    if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2].replace(/^['"]|['"]$/g, '');
-  }
-}
+require('./load-env');
+const { pool, enabled: usePostgres } = require('./database');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -42,6 +35,7 @@ function loadData() {
   }
 }
 let data = loadData();
+if (IS_VERCEL && !usePostgres) console.warn('DATABASE_URL is not configured. Vercel is using temporary local JSON storage.');
 function saveData() {
   const tmp = DATA_FILE + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
@@ -53,6 +47,113 @@ function uniqueSlug(name) {
   const base = slugify(name) || 'event'; let slug = base; let n = 2;
   while (data.events.some(e => e.slug === slug)) slug = `${base}-${n++}`;
   return slug;
+}
+function slugBase(name) { return slugify(name) || 'event'; }
+async function findEventBySlug(slug) {
+  if (!usePostgres) return data.events.find(e => e.slug === slug);
+  const result = await pool.query("SELECT id,name,TO_CHAR(date,'YYYY-MM-DD') AS date,venue,slug,created_at,registration_expires_at FROM events WHERE slug=$1", [slug]);
+  return result.rows[0];
+}
+async function findEventById(id) {
+  if (!usePostgres) return data.events.find(e => e.id === Number(id));
+  const result = await pool.query("SELECT id,name,TO_CHAR(date,'YYYY-MM-DD') AS date,venue,slug,created_at,registration_expires_at FROM events WHERE id=$1", [id]);
+  return result.rows[0];
+}
+async function latestEvent() {
+  if (!usePostgres) return [...data.events].sort((a,b) => b.id-a.id)[0];
+  const result = await pool.query("SELECT id,name,TO_CHAR(date,'YYYY-MM-DD') AS date,venue,slug,created_at,registration_expires_at FROM events ORDER BY id DESC LIMIT 1");
+  return result.rows[0];
+}
+async function listEvents() {
+  if (!usePostgres) return [...data.events].sort((a,b)=>b.id-a.id).map(e => ({...e, attendee_count:attendeesForEvent(e.id).length}));
+  const result = await pool.query("SELECT e.id,e.name,TO_CHAR(e.date,'YYYY-MM-DD') AS date,e.venue,e.slug,e.created_at,e.registration_expires_at,COUNT(a.id)::int AS attendee_count FROM events e LEFT JOIN attendees a ON a.event_id=e.id GROUP BY e.id ORDER BY e.id DESC");
+  return result.rows;
+}
+async function listEventAttendees(eventId, includeSignature = false) {
+  if (!usePostgres) return attendeesForEvent(eventId);
+  const signatureColumn = includeSignature ? ',signature_data' : '';
+  const result = await pool.query(`SELECT id,full_name,gender,designation,organisation,phone_number,nrc_number,district,mobile_registered_name,event_id,confirmation_token,created_at${signatureColumn} FROM attendees WHERE event_id=$1 ORDER BY id`, [eventId]);
+  return result.rows;
+}
+async function findRegistrationDetails(token) {
+  if (!usePostgres) {
+    const attendee = data.attendees.find(a => a.confirmation_token === token);
+    if (!attendee) return null;
+    const event = data.events.find(e => e.id === attendee.event_id);
+    return { attendee, event };
+  }
+  const result = await pool.query("SELECT a.full_name,a.gender,a.designation,a.organisation,a.phone_number,a.nrc_number,a.district,a.mobile_registered_name,a.created_at,TO_CHAR(e.date,'YYYY-MM-DD') AS event_date,e.name AS event_name,e.venue FROM attendees a LEFT JOIN events e ON e.id=a.event_id WHERE a.confirmation_token=$1", [token]);
+  const row = result.rows[0];
+  if (!row) return null;
+  return { attendee:row, event: {name:row.event_name,date:row.event_date,venue:row.venue} };
+}
+async function createEventRecord(name, date, venue, createdAt) {
+  if (!usePostgres) {
+    const event = {id:data.nextEventId++,name,date,venue,slug:uniqueSlug(name),created_at:createdAt.toISOString(),registration_expires_at:new Date(createdAt.getTime()+REGISTRATION_WINDOW_MS).toISOString()};
+    data.events.push(event); saveData(); return event;
+  }
+  const base = slugBase(name);
+  for (let suffix = 1; suffix < 1000; suffix++) {
+    const slug = suffix === 1 ? base : `${base}-${suffix}`;
+    try {
+      const result = await pool.query("INSERT INTO events (name,date,venue,slug,created_at,registration_expires_at) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,name,TO_CHAR(date,'YYYY-MM-DD') AS date,venue,slug,created_at,registration_expires_at", [name,date,venue,slug,createdAt.toISOString(),new Date(createdAt.getTime()+REGISTRATION_WINDOW_MS).toISOString()]);
+      return result.rows[0];
+    } catch (error) { if (error.code !== '23505') throw error; }
+  }
+  throw new Error('Could not create a unique event link.');
+}
+async function hasDuplicateAttendee(eventId, phone, nrc) {
+  if (!usePostgres) {
+    const existing = attendeesForEvent(eventId);
+    return { phone:existing.some(a=>String(a.phone_number).trim()===phone), nrc:existing.some(a=>String(a.nrc_number).trim().toLowerCase()===nrc.toLowerCase()) };
+  }
+  const result = await pool.query('SELECT EXISTS(SELECT 1 FROM attendees WHERE event_id=$1 AND phone_number=$2) AS phone, EXISTS(SELECT 1 FROM attendees WHERE event_id=$1 AND LOWER(nrc_number)=LOWER($3)) AS nrc', [eventId,phone,nrc]);
+  return result.rows[0];
+}
+async function createAttendeeRecord(fields, signatureBuffer) {
+  if (!usePostgres) {
+    const id = data.nextAttendeeId++;
+    const signatureFile = saveSignatureBuffer(signatureBuffer,id);
+    const attendee = {...fields,id,signature_file:signatureFile};
+    data.attendees.push(attendee); saveData(); return attendee;
+  }
+  const result = await pool.query(`INSERT INTO attendees (full_name,gender,designation,organisation,phone_number,nrc_number,district,mobile_registered_name,signature_data,event_id,confirmation_token,created_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`, [fields.full_name,fields.gender,fields.designation,fields.organisation,fields.phone_number,fields.nrc_number,fields.district,fields.mobile_registered_name,signatureBuffer,fields.event_id,fields.confirmation_token,fields.created_at]);
+  return {...fields,id:result.rows[0].id};
+}
+async function deleteEventRecord(eventId) {
+  if (!usePostgres) {
+    const eventIndex = data.events.findIndex(e => e.id === Number(eventId));
+    if (eventIndex < 0) return null;
+    const removedAttendees = data.attendees.filter(a => a.event_id === Number(eventId));
+    for (const attendee of removedAttendees) {
+      if (attendee.signature_file) { const signaturePath=path.join(SIG_DIR,path.basename(attendee.signature_file)); if(fs.existsSync(signaturePath))fs.unlinkSync(signaturePath); }
+    }
+    data.attendees=data.attendees.filter(a=>a.event_id!==Number(eventId));
+    const [removedEvent]=data.events.splice(eventIndex,1); saveData();
+    return {event:removedEvent,attendeeCount:removedAttendees.length};
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const event = await client.query("SELECT id,name,TO_CHAR(date,'YYYY-MM-DD') AS date,venue,slug,created_at,registration_expires_at FROM events WHERE id=$1 FOR UPDATE",[eventId]);
+    if (!event.rows[0]) { await client.query('ROLLBACK'); return null; }
+    const count = await client.query('SELECT COUNT(*)::int AS count FROM attendees WHERE event_id=$1',[eventId]);
+    await client.query('DELETE FROM events WHERE id=$1',[eventId]);
+    await client.query('COMMIT');
+    return {event:event.rows[0],attendeeCount:count.rows[0].count};
+  } catch (error) { await client.query('ROLLBACK'); throw error; }
+  finally { client.release(); }
+}
+async function deleteAttendeeRecord(id) {
+  if (!usePostgres) {
+    const index=data.attendees.findIndex(a=>a.id===Number(id)); if(index<0)return null;
+    const [attendee]=data.attendees.splice(index,1); saveData();
+    if(attendee.signature_file){const p=path.join(SIG_DIR,path.basename(attendee.signature_file));if(fs.existsSync(p))fs.unlinkSync(p);}
+    return attendee;
+  }
+  const result=await pool.query('DELETE FROM attendees WHERE id=$1 RETURNING id,event_id',[id]);
+  return result.rows[0] || null;
 }
 function signSession(username) {
   const payload = Buffer.from(JSON.stringify({ username, exp: Date.now() + 8 * 60 * 60 * 1000 })).toString('base64url');
@@ -78,17 +179,21 @@ function requireAdmin(req, res, next) {
   if (!verifySession(getCookie(req, 'camfed_session'))) return res.status(401).json({ error: 'Admin login required.' });
   next();
 }
-function saveSignature(dataUrl, attendeeId) {
+function parseSignature(dataUrl) {
   if (!/^data:image\/png;base64,/.test(dataUrl || '')) throw new Error('Invalid signature image.');
   const buffer = Buffer.from(dataUrl.replace(/^data:image\/png;base64,/, ''), 'base64');
   if (buffer.length < 100 || buffer.length > 2 * 1024 * 1024) throw new Error('Signature image size is invalid.');
+  return buffer;
+}
+function saveSignatureBuffer(buffer, attendeeId) {
   const filename = `signature-${attendeeId}-${Date.now()}.png`;
   fs.writeFileSync(path.join(SIG_DIR, filename), buffer);
   return filename;
 }
-function findEventBySlug(slug) { return data.events.find(e => e.slug === slug); }
 const REGISTRATION_WINDOW_MS = 2 * 60 * 60 * 1000;
 function eventExpiryMs(event) {
+  const storedExpiry = Date.parse(event.registration_expires_at || '');
+  if (Number.isFinite(storedExpiry)) return storedExpiry;
   const created = Date.parse(event.created_at || '');
   // Older records without a valid creation timestamp are closed safely rather than left open indefinitely.
   return Number.isFinite(created) ? created + REGISTRATION_WINDOW_MS : 0;
@@ -98,10 +203,10 @@ function attendeesForEvent(eventId) { return data.attendees.filter(a => a.event_
 function publicBaseUrl(req) {
   return String(process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
 }
-function buildCsv(event) {
+function buildCsv(event, attendees) {
   const rows = [
     ['Provider Id*', 'Reciever Msisdn*', 'Amount*', 'Remarks', 'Payer Wallet Type Id*(N-Normal/S-Salary)'],
-    ...attendeesForEvent(event.id).map(a => ['', a.phone_number, '', '', ''])
+    ...attendees.map(a => ['', a.phone_number, '', '', ''])
   ];
   return '\uFEFF' + rows.map(row => row.map(csvCell).join(',')).join('\r\n');
 }
@@ -131,41 +236,41 @@ app.get('/', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'index.html')));
 app.get('/admin', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'admin.html')));
 app.get('/registration-success', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'success.html')));
 app.get('/registration-details', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'attendee-details.html')));
-app.get('/api/registration-details/:token', (req, res) => {
+app.get('/api/registration-details/:token', async (req, res) => {
   const token = String(req.params.token || '');
   if (!/^[a-f0-9]{64}$/.test(token)) return res.status(404).json({ error: 'Registration details could not be found.' });
-  const attendee = data.attendees.find(a => a.confirmation_token === token);
-  if (!attendee) return res.status(404).json({ error: 'Registration details could not be found.' });
-  const event = data.events.find(e => e.id === attendee.event_id);
+  const record = await findRegistrationDetails(token);
+  if (!record) return res.status(404).json({ error: 'Registration details could not be found.' });
+  const {attendee,event} = record;
   res.json({ fullName: attendee.full_name, gender: attendee.gender, designation: attendee.designation, organisation: attendee.organisation, phoneNumber: attendee.phone_number, nrcNumber: attendee.nrc_number, district: attendee.district, mobileRegisteredName: attendee.mobile_registered_name, registeredAt: attendee.created_at, eventName: event ? event.name : 'CAMFED event', eventDate: event ? event.date : '', venue: event ? event.venue : '' });
 });
 app.get('/admin.html', (req, res) => res.redirect('/admin'));
-app.get('/register', (req, res) => {
-  const event = [...data.events].sort((a,b) => b.id-a.id)[0];
+app.get('/register', async (req, res) => {
+  const event = await latestEvent();
   return event ? res.redirect(`/register/${encodeURIComponent(event.slug)}`) : res.sendFile(path.join(PUBLIC_DIR, 'register.html'));
 });
-app.get('/register/:slug', (req, res) => {
-  if (!findEventBySlug(req.params.slug)) return res.status(404).sendFile(path.join(PUBLIC_DIR, '404.html'));
+app.get('/register/:slug', async (req, res) => {
+  if (!await findEventBySlug(req.params.slug)) return res.status(404).sendFile(path.join(PUBLIC_DIR, '404.html'));
   res.sendFile(path.join(PUBLIC_DIR, 'register.html'));
 });
 app.use(express.static(PUBLIC_DIR));
 
-app.get('/api/event/:slug', (req, res) => {
-  const e = findEventBySlug(req.params.slug);
+app.get('/api/event/:slug', async (req, res) => {
+  const e = await findEventBySlug(req.params.slug);
   if (!e) return res.status(404).json({ error: 'Event not found.' });
   res.json({ id:e.id, name:e.name, date:e.date, venue:e.venue, slug:e.slug, expiresAt:new Date(eventExpiryMs(e)).toISOString(), expired:isRegistrationExpired(e) });
 });
-app.get('/api/event', (req, res) => {
-  const e = [...data.events].sort((a,b) => b.id-a.id)[0];
+app.get('/api/event', async (req, res) => {
+  const e = await latestEvent();
   if (!e) return res.status(404).json({ error: 'No event has been created yet.' });
   res.json({ id:e.id, name:e.name, date:e.date, venue:e.venue, slug:e.slug, expiresAt:new Date(eventExpiryMs(e)).toISOString(), expired:isRegistrationExpired(e) });
 });
 
-app.post('/api/attendees', (req, res) => {
+app.post('/api/attendees', async (req, res) => {
   const b = req.body;
   const required = ['fullName','gender','designation','organisation','phoneNumber','nrcNumber','district','mobileRegisteredName','signature'];
   if (required.some(k => !String(b[k] || '').trim())) return res.status(400).json({ error: 'Please complete all required fields.' });
-  const event = b.eventSlug ? findEventBySlug(b.eventSlug) : [...data.events].sort((a,b) => b.id-a.id)[0];
+  const event = b.eventSlug ? await findEventBySlug(b.eventSlug) : await latestEvent();
   if (!event) return res.status(400).json({ error: 'No event is available for registration.' });
   if (isRegistrationExpired(event)) return res.status(410).json({ error: 'Registration for this event has expired. The registration link was valid for two hours after the event was created. Please contact the event administrator.' });
   const phone = String(b.phoneNumber).trim();
@@ -173,20 +278,24 @@ app.post('/api/attendees', (req, res) => {
   if (!/^(09|07)[0-9]{8}$/.test(phone)) return res.status(400).json({ error: 'Enter a valid Zambian mobile number, e.g. 0971234567.' });
   if (!/^[0-9]{6}\/[0-9]{2}\/[0-9]$/.test(nrc)) return res.status(400).json({ error: 'Enter NRC in the format 123456/12/1.' });
   // Prevent duplicate registrations for the same event. Phone and NRC are unique identifiers.
-  const eventAttendees = attendeesForEvent(event.id);
-  if (eventAttendees.some(a => String(a.phone_number).trim() === phone)) {
+  const duplicate = await hasDuplicateAttendee(event.id,phone,nrc);
+  if (duplicate.phone) {
     return res.status(409).json({ error: 'This phone number is already registered for this event. Please check the details or contact the event administrator.' });
   }
-  if (eventAttendees.some(a => String(a.nrc_number).trim().toLowerCase() === nrc.toLowerCase())) {
+  if (duplicate.nrc) {
     return res.status(409).json({ error: 'This NRC number is already registered for this event. Please check the details or contact the event administrator.' });
   }
-  const id = data.nextAttendeeId++;
   const confirmationToken = crypto.randomBytes(32).toString('hex');
-  let signatureFile;
-  try { signatureFile = saveSignature(String(b.signature), id); } catch (e) { return res.status(400).json({ error: e.message }); }
-  data.attendees.push({ id, full_name:String(b.fullName).trim(), gender:String(b.gender).trim(), designation:String(b.designation).trim(), organisation:String(b.organisation).trim(), phone_number:phone, nrc_number:nrc, district:String(b.district).trim(), mobile_registered_name:String(b.mobileRegisteredName).trim(), signature_file:signatureFile, event_id:event.id, confirmation_token:confirmationToken, created_at:new Date().toISOString() });
-  saveData();
-  res.status(201).json({ message:'Registration successful.', id, confirmationToken });
+  let signatureBuffer;
+  try { signatureBuffer = parseSignature(String(b.signature)); } catch (e) { return res.status(400).json({ error: e.message }); }
+  const fields = {full_name:String(b.fullName).trim(),gender:String(b.gender).trim(),designation:String(b.designation).trim(),organisation:String(b.organisation).trim(),phone_number:phone,nrc_number:nrc,district:String(b.district).trim(),mobile_registered_name:String(b.mobileRegisteredName).trim(),event_id:event.id,confirmation_token:confirmationToken,created_at:new Date().toISOString()};
+  try {
+    const attendee = await createAttendeeRecord(fields,signatureBuffer);
+    res.status(201).json({ message:'Registration successful.', id:attendee.id, confirmationToken });
+  } catch (error) {
+    if (error.code === '23505') return res.status(409).json({ error: 'This phone number or NRC number is already registered for this event.' });
+    throw error;
+  }
 });
 
 app.post('/api/admin/login', (req, res) => {
@@ -198,60 +307,48 @@ app.post('/api/admin/login', (req, res) => {
 });
 app.post('/api/admin/logout', (req,res) => { res.setHeader('Set-Cookie','camfed_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'); res.json({message:'Logged out.'}); });
 app.get('/api/admin/me', requireAdmin, (req,res) => res.json({ username:ADMIN_USERNAME }));
-app.get('/api/admin/events', requireAdmin, (req,res) => res.json([...data.events].sort((a,b)=>b.id-a.id).map(e => ({...e, attendee_count:attendeesForEvent(e.id).length}))));
-app.post('/api/admin/events', requireAdmin, (req,res) => {
+app.get('/api/admin/events', requireAdmin, async (req,res) => res.json(await listEvents()));
+app.post('/api/admin/events', requireAdmin, async (req,res) => {
   const {name,date,venue}=req.body;
   if (!String(name||'').trim() || !String(date||'').trim() || !String(venue||'').trim()) return res.status(400).json({error:'Event name, date and venue are required.'});
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(date)) || Number.isNaN(Date.parse(`${date}T00:00:00Z`))) return res.status(400).json({error:'Enter a valid event date.'});
   const createdAt = new Date();
-  const e={id:data.nextEventId++,name:String(name).trim(),date:String(date).trim(),venue:String(venue).trim(),slug:uniqueSlug(name),created_at:createdAt.toISOString(),registration_expires_at:new Date(createdAt.getTime()+REGISTRATION_WINDOW_MS).toISOString()};
-  data.events.push(e); saveData();
+  const e=await createEventRecord(String(name).trim(),String(date).trim(),String(venue).trim(),createdAt);
   const link = `${publicBaseUrl(req)}/register/${e.slug}`;
   res.status(201).json({id:e.id,slug:e.slug,link,expiresAt:e.registration_expires_at,message:'Event created. Share the registration link or download the QR-code PDF from the event card.'});
 });
-app.delete('/api/admin/events/:id', requireAdmin, (req,res) => {
+app.delete('/api/admin/events/:id', requireAdmin, async (req,res) => {
   const eventId = Number(req.params.id);
-  const eventIndex = data.events.findIndex(e => e.id === eventId);
-  if (eventIndex < 0) return res.status(404).json({ error: 'Event not found.' });
-
-  // Remove attendee records and their signature images together with the event.
-  const removedAttendees = data.attendees.filter(a => a.event_id === eventId);
-  for (const attendee of removedAttendees) {
-    if (attendee.signature_file) {
-      const signaturePath = path.join(SIG_DIR, path.basename(attendee.signature_file));
-      if (fs.existsSync(signaturePath)) fs.unlinkSync(signaturePath);
-    }
-  }
-  data.attendees = data.attendees.filter(a => a.event_id !== eventId);
-  const [removedEvent] = data.events.splice(eventIndex, 1);
-  saveData();
+  const removed=await deleteEventRecord(eventId);
+  if (!removed) return res.status(404).json({ error: 'Event not found.' });
 
   // Remove this event's generated attendance PDF, if one exists.
-  const safeSlug = String(removedEvent.slug || '').replace(/[^a-z0-9-]/gi, '_');
+  const safeSlug = String(removed.event.slug || '').replace(/[^a-z0-9-]/gi, '_');
   const pdfPath = path.join(PDF_DIR, `${safeSlug}-attendance.pdf`);
   if (fs.existsSync(pdfPath)) fs.unlinkSync(pdfPath);
 
-  res.json({ message: 'Event and its attendee records deleted.', deletedAttendees: removedAttendees.length });
+  res.json({ message: 'Event and its attendee records deleted.', deletedAttendees: removed.attendeeCount });
 });
-app.get('/api/admin/events/:id/attendees', requireAdmin, (req,res) => {
-  const e=data.events.find(x=>x.id===Number(req.params.id)); if(!e)return res.status(404).json({error:'Event not found.'});
-  res.json({event:e,attendees:attendeesForEvent(e.id)});
+app.get('/api/admin/events/:id/attendees', requireAdmin, async (req,res) => {
+  const e=await findEventById(req.params.id); if(!e)return res.status(404).json({error:'Event not found.'});
+  const attendees=await listEventAttendees(e.id);
+  res.json({event:e,attendees});
 });
 function csvCell(value) {
   // Quote every cell and escape embedded quotes. Keep phone numbers as text in the CSV.
   return '"' + String(value ?? '').replace(/"/g, '""') + '"';
 }
-app.get('/api/admin/events/:id/csv', requireAdmin, (req,res) => {
-  const e = data.events.find(x => x.id === Number(req.params.id));
+app.get('/api/admin/events/:id/csv', requireAdmin, async (req,res) => {
+  const e = await findEventById(req.params.id);
   if (!e) return res.status(404).json({ error: 'Event not found.' });
+  const attendees=await listEventAttendees(e.id);
   const safe = e.slug.replace(/[^a-z0-9-]/gi, '_');
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="${safe}-attendees.csv"`);
-  res.send(buildCsv(e));
+  res.send(buildCsv(e,attendees));
 });
-app.delete('/api/admin/attendees/:id', requireAdmin, (req,res) => {
-  const i=data.attendees.findIndex(a=>a.id===Number(req.params.id)); if(i<0)return res.status(404).json({error:'Attendee not found.'});
-  const a=data.attendees[i]; data.attendees.splice(i,1); saveData();
-  if(a.signature_file){const p=path.join(SIG_DIR,a.signature_file);if(fs.existsSync(p))fs.unlinkSync(p);}
+app.delete('/api/admin/attendees/:id', requireAdmin, async (req,res) => {
+  const a=await deleteAttendeeRecord(req.params.id); if(!a)return res.status(404).json({error:'Attendee not found.'});
   res.json({message:'Attendee deleted.'});
 });
 
@@ -314,8 +411,8 @@ function makePdf(event,attendees,filePath){
     vals.forEach((v,i)=>{
       doc.rect(x,y,cols[i],rowH).stroke();
       if(i===9){
-        const sig=path.join(SIG_DIR,a.signature_file);
-        if(fs.existsSync(sig)) doc.image(sig,x+4,y+4,{fit:[cols[i]-8,rowH-8],align:'center',valign:'center'});
+        const sig=a.signature_data || (a.signature_file && path.join(SIG_DIR,a.signature_file));
+        if(sig && (Buffer.isBuffer(sig) || fs.existsSync(sig))) doc.image(sig,x+4,y+4,{fit:[cols[i]-8,rowH-8],align:'center',valign:'center'});
       } else {
         fitText(doc,v,x+2,y+5,cols[i]-4,{size:i===1?5.7:5.5,height:11,align:i===0?'center':'left'});
       }
@@ -333,7 +430,7 @@ function makePdf(event,attendees,filePath){
   doc.end();
   return new Promise((resolve,reject)=>{stream.on('finish',()=>resolve(filePath));stream.on('error',reject);});
 }
-app.get('/api/admin/events/:id/pdf',requireAdmin,async(req,res)=>{const e=data.events.find(x=>x.id===Number(req.params.id));if(!e)return res.status(404).json({error:'Event not found.'});const a=attendeesForEvent(e.id);if(!a.length)return res.status(400).json({error:'No attendee details are available yet, so an attendance PDF cannot be generated.'});const safe=e.slug.replace(/[^a-z0-9-]/gi,'_');const filePath=path.join(PDF_DIR,`${safe}-attendance.pdf`);try{await makePdf(e,a,filePath);res.download(filePath,`${safe}-attendance.pdf`);}catch(err){console.error(err);res.status(500).json({error:'PDF generation failed.'});}});
+app.get('/api/admin/events/:id/pdf',requireAdmin,async(req,res)=>{const e=await findEventById(req.params.id);if(!e)return res.status(404).json({error:'Event not found.'});const a=await listEventAttendees(e.id,true);if(!a.length)return res.status(400).json({error:'No attendee details are available yet, so an attendance PDF cannot be generated.'});const safe=e.slug.replace(/[^a-z0-9-]/gi,'_');const filePath=path.join(PDF_DIR,`${safe}-attendance.pdf`);try{await makePdf(e,a,filePath);res.download(filePath,`${safe}-attendance.pdf`);}catch(err){console.error(err);res.status(500).json({error:'PDF generation failed.'});}});
 
 app.use((req,res,next)=>{if(req.method==='GET'&&req.accepts('html'))return res.status(404).sendFile(path.join(PUBLIC_DIR,'404.html'));next();});
 app.use((err,req,res,next)=>{console.error(err);res.status(500).json({error:'Internal server error.'});});
